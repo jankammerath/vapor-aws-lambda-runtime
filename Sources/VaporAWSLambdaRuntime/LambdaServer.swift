@@ -2,189 +2,149 @@ import AWSLambdaEvents
 import AWSLambdaRuntime
 import Vapor
 
+// MARK: Application + Lambda
+
+public extension Application {
+    var lambda: Lambda {
+        .init(application: self)
+    }
+
+    struct Lambda {
+        public let application: Application
+    }
+}
+
+public extension Application.Servers.Provider {
+    static var lambda: Self {
+        .init {
+            $0.servers.use { $0.lambda.server.shared }
+        }
+    }
+}
+
+// MARK: Application + Lambda + Server
+
+public extension Application.Lambda {
+    var server: Server {
+        .init(application: application)
+    }
+
+    struct Server {
+        let application: Application
+
+        public var shared: LambdaServer {
+            if let existing = application.storage[Key.self] {
+                return existing
+            } else {
+                let new = LambdaServer(
+                    application: application,
+                    responder: application.responder.current,
+                    configuration: self.configuration,
+                    on: self.application.eventLoopGroup
+                )
+                self.application.storage[Key.self] = new
+                return new
+            }
+        }
+
+        struct Key: StorageKey {
+            typealias Value = LambdaServer
+        }
+
+        public var configuration: LambdaServer.Configuration {
+            get {
+                self.application.storage[ConfigurationKey.self] ?? .init(
+                    logger: self.application.logger
+                )
+            }
+            nonmutating set {
+                if self.application.storage.contains(Key.self) {
+                    self.application.logger.warning("Cannot modify server configuration after server has been used.")
+                } else {
+                    self.application.storage[ConfigurationKey.self] = newValue
+                }
+            }
+        }
+
+        struct ConfigurationKey: StorageKey {
+            typealias Value = LambdaServer.Configuration
+        }
+    }
+}
+
 // MARK: LambdaServer
 
-public protocol VaporLambda: ByteBufferLambdaHandler {
-    init(app: Application) async throws
-
-    var app: Application { get }
-    static var requestSource: RequestSource { get }
-
-    /// Used to set up globals such as logging, tracing, metrics, etc.
-    static func bootstrap() async throws
-
-    func configureApplication(_ app: Application) async throws
-    func deconfigureApplication(_ app: Application) async throws
-
-    func addRoutes(to app: Application) async throws
-}
-
-extension VaporLambda {
-    public static func bootstrap() async throws {}
-
-    public static func makeHandler(context: LambdaInitializationContext) -> EventLoopFuture<Self> {
-        let promise = context.eventLoop.makePromise(of: Self.self)
-        promise.completeWithTask {
-            let app = try Application(.detect())
-            let lambda = try await Self(app: app)
-
-            do {
-                try await lambda.configureApplication(app)
-                try await lambda.addRoutes(to: app)
-            } catch {
-                app.logger.report(error: error)
-                throw error
-            }
-
-            context.terminator.register(name: "Vapor App") { eventLoop in
-                let promise = eventLoop.makePromise(of: Void.self)
-                promise.completeWithTask {
-                    try await lambda.deconfigureApplication(app)
-                    app.shutdown()
-                }
-                return promise.futureResult
-            }
-
-            switch Self.requestSource.source {
-            case .vapor:
-                try app.start()
-            case .apiGateway, .apiGatewayV2:
-                // Fake server, not actually opening a socket
-                app.servers.use { _ in
-                    LambdaServer(shutdownPromise: context.eventLoop.makePromise())
-                }
-
-                try app.start()
-            }
-
-            return lambda
+public class LambdaServer: Server {
+    public struct Configuration {
+        public enum RequestSource {
+            case apiGateway
+            case apiGatewayV2
+//      case applicationLoadBalancer // not in this release
         }
 
-        return promise.futureResult
-    }
+        var requestSource: RequestSource
+        var logger: Logger
 
-    public static func main() async throws {
-        try await Self.bootstrap()
-        let app = try Application(.detect())
-        if Self.requestSource.source == .vapor {
-            let lambda = try await Self(app: app)
-
-            do {
-                try await lambda.configureApplication(app)
-                try await lambda.addRoutes(to: app)
-            } catch {
-                app.logger.report(error: error)
-                try await lambda.deconfigureApplication(app)
-                throw error
-            }
-
-            do {
-                try app.start()
-                try await app.running?.onStop.get()
-                try await lambda.deconfigureApplication(app)
-            } catch {
-                try await lambda.deconfigureApplication(app)
-                throw error
-            }
-        } else {
-            let handler: any ByteBufferLambdaHandler.Type = Self.self
-            handler.main()
+        public init(apiService: RequestSource = .apiGatewayV2, logger: Logger) {
+            self.requestSource = apiService
+            self.logger = logger
         }
     }
 
-    public func handle(
-        _ buffer: ByteBuffer,
-        context: LambdaContext
-    ) -> EventLoopFuture<ByteBuffer?> {
-        do {
-            switch Self.requestSource.source {
-            case .vapor:
-                preconditionFailure("Vapor Server hosted services do not handle lambdas")
-            case .apiGateway:
-                let lamdaRequest = try JSONDecoder().decode(
-                    APIGatewayRequest.self,
-                    from: buffer
-                )
-                let vaporRequest = try Request(
-                    req: lamdaRequest,
-                    in: context,
-                    for: app
-                )
+    private let application: Application
+    private let responder: Responder
+    private let configuration: Configuration
+    private let eventLoop: EventLoop
+    private var lambdaLifecycle: Lambda.Lifecycle
 
-                return app.responder.respond(to: vaporRequest)
-                    .map(APIGatewayResponse.init)
-                    .flatMapThrowing { response in
-                        try JSONEncoder().encodeAsByteBuffer(
-                            response,
-                            allocator: context.allocator
-                        )
-                    }
-            case .apiGatewayV2:
-                let lamdaRequest = try JSONDecoder().decode(
-                    APIGatewayV2Request.self,
-                    from: buffer
-                )
-                let vaporRequest = try Vapor.Request(
-                    req: lamdaRequest,
-                    in: context,
-                    for: app
-                )
+    init(application: Application,
+         responder: Responder,
+         configuration: Configuration,
+         on eventLoopGroup: EventLoopGroup)
+    {
+        self.application = application
+        self.responder = responder
+        self.configuration = configuration
 
-                return app.responder.respond(to: vaporRequest).flatMap {
-                    APIGatewayV2Response.from(response: $0, in: context)
-                }.flatMapThrowing { response in
-                    try JSONEncoder().encodeAsByteBuffer(
-                        response,
-                        allocator: context.allocator
-                    )
-                }
-            }
-        } catch {
-            return context.eventLoop.makeFailedFuture(error)
+        self.eventLoop = eventLoopGroup.next()
+
+        let handler: ByteBufferLambdaHandler
+
+        switch configuration.requestSource {
+        case .apiGateway:
+            handler = APIGatewayHandler(application: application, responder: responder)
+        case .apiGatewayV2:
+            handler = APIGatewayV2Handler(application: application, responder: responder)
+        }
+
+        self.lambdaLifecycle = Lambda.Lifecycle(
+            eventLoop: self.eventLoop,
+            logger: self.application.logger
+        ) {
+            $0.eventLoop.makeSucceededFuture(handler)
         }
     }
-}
 
-internal final class LambdaServer: Server {
-    let shutdownPromise: EventLoopPromise<Void>
+    public func start(hostname _: String?, port _: Int?) throws {
+        self.eventLoop.execute {
+            _ = self.lambdaLifecycle.start()
+        }
 
-    init(shutdownPromise: EventLoopPromise<Void>) {
-        self.shutdownPromise = shutdownPromise
+        self.lambdaLifecycle.shutdownFuture.whenComplete { _ in
+            DispatchQueue(label: "shutdown").async {
+                self.application.shutdown()
+            }
+        }
     }
 
-    var onShutdown: EventLoopFuture<Void> {
-        shutdownPromise.futureResult
+    public var onShutdown: EventLoopFuture<Void> {
+        self.lambdaLifecycle.shutdownFuture.map { _ in }
     }
 
-    func start(address: BindAddress?) throws { }
-
-    func shutdown() {
-        shutdownPromise.succeed()
-    }
-
-    deinit {
-        shutdownPromise.succeed()
-    }
-}
-
-public struct RequestSource {
-    internal enum _RequestSource {
-        case vapor
-        case apiGateway
-        case apiGatewayV2
-    }
-
-    let source: _RequestSource
-
-    public static func vapor() -> RequestSource {
-        RequestSource(source: .vapor)
-    }
-
-    public static func apiGateway() -> RequestSource {
-        RequestSource(source: .apiGateway)
-    }
-
-    public static func apiGatewayV2() -> RequestSource {
-        RequestSource(source: .apiGatewayV2)
+    public func shutdown() {
+        // this should only be executed after someone has called `app.shutdown()`
+        // on lambda the ones calling should always be us!
+        // If we have called shutdown, the lambda server already is shutdown.
+        // That means, we have nothing to do here.
     }
 }

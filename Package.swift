@@ -5,9 +5,6 @@ import PackageDescription
 
 let package = Package(
     name: "vapor-aws-lambda-runtime",
-    platforms: [
-        .macOS(.v12),
-    ],
     products: [
         .library(
             name: "VaporAWSLambdaRuntime",

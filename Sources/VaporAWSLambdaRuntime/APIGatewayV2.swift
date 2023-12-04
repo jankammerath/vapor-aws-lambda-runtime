@@ -5,12 +5,40 @@ import NIO
 import NIOHTTP1
 import Vapor
 
+// MARK: - Handler -
+
+struct APIGatewayV2Handler: EventLoopLambdaHandler {
+    typealias In = APIGateway.V2.Request
+    typealias Out = APIGateway.V2.Response
+
+    private let application: Application
+    private let responder: Responder
+
+    init(application: Application, responder: Responder) {
+        self.application = application
+        self.responder = responder
+    }
+
+    public func handle(context: Lambda.Context, event: APIGateway.V2.Request)
+        -> EventLoopFuture<APIGateway.V2.Response>
+    {
+        let vaporRequest: Vapor.Request
+        do {
+            vaporRequest = try Vapor.Request(req: event, in: context, for: self.application)
+        } catch {
+            return context.eventLoop.makeFailedFuture(error)
+        }
+
+        return self.responder.respond(to: vaporRequest).flatMap { APIGateway.V2.Response.from(response: $0, in: context) }
+    }
+}
+
 // MARK: - Request -
 
 extension Vapor.Request {
     private static let bufferAllocator = ByteBufferAllocator()
 
-    convenience init(req: APIGatewayV2Request, in ctx: LambdaContext, for application: Application) throws {
+    convenience init(req: APIGateway.V2.Request, in ctx: Lambda.Context, for application: Application) throws {
         var buffer: NIO.ByteBuffer?
         switch (req.body, req.isBase64Encoded) {
         case (let .some(string), true):
@@ -52,24 +80,18 @@ extension Vapor.Request {
             on: ctx.eventLoop
         )
 
-        storage[APIGatewayV2RequestStorageKey.self] = req
+        storage[APIGateway.V2.Request.self] = req
     }
 }
 
-fileprivate struct APIGatewayV2RequestStorageKey: Vapor.StorageKey {
-    typealias Value = APIGatewayV2Request
-}
-
-extension Request {
-    public var apiGatewayV2Request: APIGatewayV2Request? {
-        storage[APIGatewayV2RequestStorageKey.self]
-    }
+extension APIGateway.V2.Request: Vapor.StorageKey {
+    public typealias Value = APIGateway.V2.Request
 }
 
 // MARK: - Response -
 
-extension APIGatewayV2Response {
-    static func from(response: Vapor.Response, in context: LambdaContext) -> EventLoopFuture<APIGatewayV2Response> {
+extension APIGateway.V2.Response {
+    static func from(response: Vapor.Response, in context: Lambda.Context) -> EventLoopFuture<APIGateway.V2.Response> {
         // Create the headers
         var headers = [String: String]()
         response.headers.forEach { name, value in
@@ -97,20 +119,20 @@ extension APIGatewayV2Response {
             ))
         } else {
             // See if it is a stream and try to gather the data
-            return response.body.collect(on: context.eventLoop).map { buffer -> APIGatewayV2Response in
+            return response.body.collect(on: context.eventLoop).map { buffer -> APIGateway.V2.Response in
                 // Was there any content
                 guard
                     var buffer = buffer,
                     let bytes = buffer.readBytes(length: buffer.readableBytes)
                 else {
-                    return APIGatewayV2Response(
+                    return APIGateway.V2.Response(
                         statusCode: AWSLambdaEvents.HTTPResponseStatus(code: response.status.code),
                         headers: headers
                     )
                 }
 
                 // Done
-                return APIGatewayV2Response(
+                return APIGateway.V2.Response(
                     statusCode: AWSLambdaEvents.HTTPResponseStatus(code: response.status.code),
                     headers: headers,
                     body: String(base64Encoding: bytes),
